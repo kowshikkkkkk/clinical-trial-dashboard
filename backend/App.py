@@ -276,27 +276,25 @@ OVERALL SUMMARY:
     except Exception as e:
         return error(f"Failed to load data context: {str(e)}")
 
-    # Call Groq API instead of Claude
-    api_key = os.environ.get("GROQ_API_KEY", "")
+    # Call Claude API
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        return error("GROQ_API_KEY environment variable not set.")
+        return error("ANTHROPIC_API_KEY environment variable not set.")
 
     payload = json.dumps({
-        "model": "llama3-70b-8192",
-        "messages": [
-            {"role": "system", "content": context},
-            {"role": "user",   "content": question}
-        ],
+        "model": "claude-sonnet-4-20250514",
         "max_tokens": 1000,
-        "temperature": 0.3,
+        "system": context,
+        "messages": [{"role": "user", "content": question}]
     }).encode("utf-8")
 
     req = urllib.request.Request(
-        "https://api.groq.com/openai/v1/chat/completions",
+        "https://api.anthropic.com/v1/messages",
         data    = payload,
         headers = {
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {api_key}",
+            "Content-Type":      "application/json",
+            "x-api-key":         api_key,
+            "anthropic-version": "2023-06-01",
         },
         method = "POST",
     )
@@ -304,12 +302,13 @@ OVERALL SUMMARY:
     try:
         with urllib.request.urlopen(req) as resp:
             data   = json.loads(resp.read().decode("utf-8"))
-            answer = data["choices"][0]["message"]["content"]
+            answer = data["content"][0]["text"]
         return jsonify({"answer": answer})
     except urllib.error.HTTPError as e:
-        return error(f"Groq API error: {e.read().decode()}", 502)
+        return error(f"Claude API error: {e.read().decode()}", 502)
     except Exception as e:
         return error(f"Unexpected error: {str(e)}", 500)
+
 
 # ── HEALTH CHECK ──────────────────────────────────────────────────────────────
 
@@ -320,6 +319,176 @@ def health():
 
 # ── RUN ───────────────────────────────────────────────────────────────────────
 
+# ── AGENT ROUTES ──────────────────────────────────────────────────────────────
+
+@app.route("/api/agent/scan", methods=["GET"])
+def agent_scan():
+    import json, urllib.request
+    sites = query_db("SELECT * FROM site_metrics ORDER BY avg_dqi ASC")
+    study = query_db("SELECT * FROM study_metrics ORDER BY avg_dqi ASC")
+    prompt = f"""You are a clinical trial risk management agent. Analyze the site data below and generate a prioritized action plan.
+
+For each at-risk site, specify:
+1. PRIORITY (Critical/High/Medium)
+2. SITE (study + site_id + country)
+3. RISK REASON (specific metric that triggered the flag)
+4. RECOMMENDED ACTION (exactly what the CRA or DM should do)
+5. DEADLINE (how urgent - immediate/this week/this month)
+
+Focus on the worst 10 sites. Be specific with numbers. Format each as a clear action item.
+
+SITE DATA:
+{json.dumps(sites[:30], indent=2)}
+
+STUDY DATA:
+{json.dumps(study, indent=2)}"""
+
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        return error("GROQ_API_KEY not set")
+
+    payload = json.dumps({
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": "You are a clinical data quality agent. Be concise, specific, and action-oriented."},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 1500,
+        "temperature": 0.2,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data   = json.loads(resp.read().decode("utf-8"))
+            answer = data["choices"][0]["message"]["content"]
+        return jsonify({"action_plan": answer, "sites_scanned": len(sites)})
+    except Exception as e:
+        return error(str(e), 500)
+
+
+@app.route("/api/agent/report", methods=["POST"])
+def agent_report():
+    import json, urllib.request
+    body    = request.get_json()
+    study   = body.get("study")
+    site_id = body.get("site_id")
+    if not study or not site_id:
+        return error("Request body must include study and site_id")
+
+    site_data = query_db("SELECT * FROM site_metrics WHERE study = :study AND site_id = :site_id",
+                         {"study": study, "site_id": site_id})
+    subject_data = query_db("""
+        SELECT subject, dqi_score, is_clean, total_queries,
+               missing_page_count, total_uncoded, crfs_never_signed,
+               pds_confirmed, open_edrr_issues
+        FROM subject_metrics
+        WHERE study = :study AND site_id = :site_id
+        ORDER BY dqi_score ASC LIMIT 20
+    """, {"study": study, "site_id": site_id})
+
+    prompt = f"""Generate a professional Clinical Research Associate (CRA) site visit report for:
+Study: {study}
+Site: {site_id}
+
+Use this data:
+SITE METRICS: {json.dumps(site_data, indent=2)}
+SUBJECT DETAILS: {json.dumps(subject_data, indent=2)}
+
+The report should include:
+1. SITE OVERVIEW - key metrics summary
+2. CRITICAL FINDINGS - specific issues with subject IDs and numbers
+3. DATA QUALITY STATUS - DQI score interpretation
+4. REQUIRED ACTIONS - numbered list, assigned to CRA/DM/Site
+5. FOLLOW-UP TIMELINE - specific deadlines
+
+Write in professional clinical trial language. Be specific with numbers."""
+
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        return error("GROQ_API_KEY not set")
+
+    payload = json.dumps({
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": "You are an expert Clinical Research Associate writing formal site visit reports."},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 1500,
+        "temperature": 0.2,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.groqcom/openai/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data   = json.loads(resp.read().decode("utf-8"))
+            answer = data["choices"][0]["message"]["content"]
+        return jsonify({"report": answer})
+    except Exception as e:
+        return error(str(e), 500)
+
+
+@app.route("/api/agent/readiness", methods=["GET"])
+def agent_readiness():
+    import json, urllib.request
+    studies = query_db("SELECT * FROM study_metrics ORDER BY avg_dqi DESC")
+    alerts  = query_db("SELECT * FROM site_metrics WHERE risk_flag = 'True' ORDER BY avg_dqi ASC")
+
+    prompt = f"""You are a clinical data submission readiness agent. For each study below, give a GO / NO-GO decision for interim analysis or regulatory submission.
+
+For each study provide:
+1. STUDY NAME
+2. DECISION: GO or NO-GO or CONDITIONAL
+3. DQI STATUS: score and what it means
+4. BLOCKING ISSUES: specific metrics that prevent submission (if any)
+5. REQUIRED ACTIONS: what must be resolved before GO (if NO-GO)
+6. ESTIMATED EFFORT: how much work is needed to reach GO
+
+Be decisive. Use the actual numbers. A study needs DQI >= 80 AND >= 70% clean subjects to be GO.
+
+STUDY METRICS:
+{json.dumps(studies, indent=2)}
+
+AT-RISK SITES:
+{json.dumps(alerts[:15], indent=2)}"""
+
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        return error("GROQ_API_KEY not set")
+
+    payload = json.dumps({
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": "You are a clinical data submission readiness expert. Be decisive and specific."},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 2000,
+        "temperature": 0.2,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data   = json.loads(resp.read().decode("utf-8"))
+            answer = data["choices"][0]["message"]["content"]
+        return jsonify({"readiness_report": answer, "total_studies": len(studies)})
+    except Exception as e:
+        return error(str(e), 500)
 if __name__ == "__main__":
     print("Starting Clinical Trial Dashboard API...")
     print(f"Database: {os.path.abspath(DB_PATH)}")
